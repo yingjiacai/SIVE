@@ -1,0 +1,69 @@
+{
+  "appendix_c_1": {
+    "model": "Toy",
+    "beta": 1.0,
+    "n": 10000,
+    "h": 2.0,
+    "base_lr": 0.05,
+    "M": 100000,
+    "N": 64,
+    "apply_burn_in": true,
+    "burn_in_ratio": 0.3,
+    "L0": 100,
+    "eval_noisy": 0.002,
+    "multiplicity": 2,
+    "init_theta": [0.2, 0.2]
+  },
+  "4-1-1": {
+    "model": "Toy",
+    "beta": 1.0,
+    "n": 10000,
+    "h": 2.0,
+    "base_lr": 0.05,
+    "M": 100000,
+    "N": 64,
+    "apply_burn_in": true,
+    "burn_in_ratio": 0.3,
+    "L0": 100,
+    "eval_noisy": 0.002,
+    "multiplicity": 1,
+    "init_theta": [0.2, 0.2]
+  },
+  "4-1-2": {
+    "model": "Toy",
+    "beta": 1.0,
+    "n": 10000,
+    "h": 2.0,
+    "base_lr": 0.05,
+    "M": 100000,
+    "N": 64,
+    "apply_burn_in": true,
+    "burn_in_ratio": 0.3,
+    "L0": 100,
+    "eval_noisy": 0.002,
+    "multiplicity": 2,
+    "init_theta": [0.2, 0.2]
+  },
+  "4-2-1": {
+    "model": "Mlp",
+    "beta": 1.0,
+    "n": 10000,
+    "h": 2.0,
+    "base_lr": 0.05,
+    "M": 100000,
+    "N": 512,
+    "eval_batch_size": 64,
+    "grad_batch_size": 1024,
+    "apply_burn_in": true,
+    "burn_in_ratio": 0.3,
+    "checkpoint_interval": 1,
+    "device": "cuda"
+  },
+  "mlp_trajectories": {
+    "model": "Mlp",
+    "train_epochs": 300,
+    "train_lr": 0.01,
+    "checkpoint_interval": 1,
+    "device": "cuda"
+  }
+}
