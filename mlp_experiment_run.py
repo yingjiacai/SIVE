@@ -1,6 +1,9 @@
 import os
+import sys
 import json
+import glob
 import random
+import argparse
 from datetime import datetime
 
 import torch
@@ -204,23 +207,236 @@ def run_experiment(config, num_trajectories, num_trials):
         print(f"\n  Saved: {traj_csv}")
 
 
-if __name__ == "__main__":
-    experiments_list = ["4-2-1"]
-    for experiment_name in experiments_list:
+def load_existing_trial_data(traj_out_dir, before_trial=None):
+    """Load trial data from existing raw_trial_*.csv files in a trajectory directory.
 
-        experiment_settings = json.load(open("experiment_settings.json"))
+    Args:
+        traj_out_dir: path to trajectory output directory
+        before_trial: if set, only load trials with index < before_trial
+                      (i.e., skip trials that will be re-run)
 
+    Returns:
+        trials_data: {epoch: {'Online': [...], 'Ours': [...], 'Retrospective': [...]}}
+        loss_data: {epoch: (train_loss, test_loss)}
+    """
+    trials_data = {}
+    loss_data = {}
+
+    pattern = os.path.join(traj_out_dir, "raw_trial_*.csv")
+    csv_files = sorted(glob.glob(pattern))
+
+    for csv_path in csv_files:
+        basename = os.path.basename(csv_path)
+        # "raw_trial_N.csv" → N
+        trial_idx = int(basename.replace("raw_trial_", "").replace(".csv", ""))
+
+        if before_trial is not None and trial_idx >= before_trial:
+            continue
+
+        df = pd.read_csv(csv_path)
+
+        # Initialize trials_data on first file
+        if not trials_data:
+            for epoch in df['Epoch'].values:
+                trials_data[int(epoch)] = {
+                    'Online': [], 'Ours': [], 'Retrospective': []
+                }
+
+        for _, row in df.iterrows():
+            epoch = int(row['Epoch'])
+            if epoch not in trials_data:
+                continue
+            trials_data[epoch]['Online'].append(row['Online'])
+            trials_data[epoch]['Ours'].append(row['Ours'])
+            trials_data[epoch]['Retrospective'].append(row['Retrospective'])
+
+        # Loss data from trial 0 (checkpoint-level values, deterministic)
+        if trial_idx == 0:
+            for _, row in df.iterrows():
+                loss_data[int(row['Epoch'])] = (
+                    row['Train_Loss'], row['Test_Loss']
+                )
+
+    return trials_data, loss_data
+
+
+def resume_experiment(out_dir, start_trial):
+    """Resume an interrupted experiment from a given trial index.
+
+    Args:
+        out_dir: path to an existing output directory (e.g. outputs/main_experiment_20260619_125458)
+        start_trial: trial index to start/resume from (0-based)
+    """
+    config_path = os.path.join(out_dir, "config.json")
+    if not os.path.exists(config_path):
+        print(f"Error: config.json not found in {out_dir}")
+        sys.exit(1)
+
+    config = json.load(open(config_path))
+    # Restore device
+    if 'device' in config and config['device']:
+        config['device'] = torch.device(config['device'])
+    else:
+        config['device'] = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    num_trajectories = config.get('num_trajectories', 1)
+    num_trials = config.get('num_trials', 5)
+
+    if start_trial >= num_trials:
+        print(f"start_trial={start_trial} >= num_trials={num_trials}, nothing to do.")
+        return
+
+    print(f"Resuming experiment in: {out_dir}")
+    print(f"  Config: {config}")
+    print(f"  Trajectories: {num_trajectories}, Trials: {start_trial} → {num_trials - 1} "
+          f"({num_trials - start_trial} to run)")
+
+    for traj in range(num_trajectories):
         print()
-        print(f"Running {experiment_name}...")
+        print(f"{'='*70}")
+        print(f"Trajectory {traj + 1}/{num_trajectories}")
+        print(f"{'='*70}")
 
-        config = experiment_settings[experiment_name]
+        traj_input_dir = f"outputs/trajectory_{traj}"
+        traj_out_dir = os.path.join(out_dir, f"trajectory_{traj}")
+        os.makedirs(traj_out_dir, exist_ok=True)
+        checkpoint_dir = os.path.join(traj_input_dir, "mnist_checkpoints")
 
-        config['t'] = config['n'] * config['beta']
-        config['lr'] = config['base_lr'] / config['t']
-        config['experiment_name'] = experiment_name
-        if 'device' not in config:
-            config['device'] = "cuda" if torch.cuda.is_available() else "cpu"
+        checkpoints = {}
+        for f in sorted(os.listdir(checkpoint_dir)):
+            if f.startswith("epoch_") and f.endswith(".pt"):
+                epoch = int(f.replace("epoch_", "").replace(".pt", ""))
+                if epoch % config['checkpoint_interval'] == 0:
+                    checkpoints[epoch] = os.path.join(checkpoint_dir, f)
 
-        num_trajectories = config.get('num_trajectories', 1)
-        num_trials = config.get('num_trials', 5)
-        run_experiment(config, num_trajectories, num_trials)
+        if not checkpoints:
+            raise FileNotFoundError(f"No checkpoint files found in {checkpoint_dir}")
+
+        # Load data from trials that ran before the interruption
+        trials_data, loss_data = load_existing_trial_data(
+            traj_out_dir, before_trial=start_trial
+        )
+
+        # If no data loaded yet (start_trial == 0), initialize fresh
+        if not trials_data:
+            for epoch in sorted(checkpoints.keys()):
+                trials_data[epoch] = {
+                    'Online': [], 'Ours': [], 'Retrospective': []
+                }
+
+        print(f"  Loaded {len(loss_data)} epochs of loss data, "
+              f"{len(trials_data[sorted(trials_data.keys())[0]]['Online']) if trials_data else 0} "
+              f"existing trials")
+
+        for t in tqdm(range(start_trial, num_trials),
+                       desc=f"  SGLD trials", unit="trial", leave=False):
+            rows, sgld_histories = run_single_sgld(config, checkpoints, seed=t)
+            for row in rows:
+                epoch = row['Epoch']
+                trials_data[epoch]['Online'].append(row['Online'])
+                trials_data[epoch]['Ours'].append(row['Ours'])
+                trials_data[epoch]['Retrospective'].append(row['Retrospective'])
+                # Grab loss data from the first trial we encounter if missing
+                if not loss_data:
+                    loss_data[epoch] = (row['Train_Loss'], row['Test_Loss'])
+
+            trial_df = pd.DataFrame(rows)
+            trial_csv = os.path.join(traj_out_dir, f"raw_trial_{t}.csv")
+            trial_df.to_csv(trial_csv, index=False)
+
+            npz_data = {}
+            for epoch, hist in sgld_histories.items():
+                npz_data[f"epoch_{epoch}_L_bar_m"] = np.asarray(hist['L_bar_m'])
+                npz_data[f"epoch_{epoch}_s2_m"] = np.asarray(hist['s2_m'])
+                npz_data[f"epoch_{epoch}_L_true_m"] = np.asarray(hist['L_true_m'])
+            npz_path = os.path.join(traj_out_dir, f"sgld_trial_{t}.npz")
+            np.savez_compressed(npz_path, **npz_data)
+
+        # Rebuild summary from all available trials
+        summary_rows = []
+        for epoch in sorted(checkpoints.keys()):
+            epoch_data = trials_data[epoch]
+            train_loss, test_loss = loss_data.get(
+                epoch, (float('nan'), float('nan'))
+            )
+            n_trials = len(epoch_data['Online'])
+            summary_rows.append({
+                'Epoch': epoch,
+                'Train_Loss': train_loss,
+                'Test_Loss': test_loss,
+                'Online_mean': np.mean(epoch_data['Online']),
+                'Online_std': np.std(epoch_data['Online'], ddof=1) if n_trials > 1 else 0.0,
+                'Retrospective_mean': np.mean(epoch_data['Retrospective']),
+                'Retrospective_std': np.std(epoch_data['Retrospective'], ddof=1) if n_trials > 1 else 0.0,
+                'Ours_mean': np.mean(epoch_data['Ours']),
+                'Ours_std': np.std(epoch_data['Ours'], ddof=1) if n_trials > 1 else 0.0,
+            })
+
+        traj_df = pd.DataFrame(summary_rows)
+
+        print(f"\n  {'Epoch':>6}  {'TrainLoss':>10}  {'TestLoss':>10}  "
+              f"{'Online':>22} {'Retrospective':>22} {'Ours':>22}")
+        print("-" * 100)
+        for _, row in traj_df.iterrows():
+            online_std = row['Online_std'] if row['Online_std'] is not None else 0.0
+            ret_std = row['Retrospective_std'] if row['Retrospective_std'] is not None else 0.0
+            ours_std = row['Ours_std'] if row['Ours_std'] is not None else 0.0
+            print(f"  {int(row['Epoch']):>6}  "
+                  f"{row['Train_Loss']:>10.4f}  "
+                  f"{row['Test_Loss']:>10.4f}  "
+                  f"{row['Online_mean']:>12.4f} +/- {online_std:<5.4f}  "
+                  f"{row['Retrospective_mean']:>12.4f} +/- {ret_std:<5.4f}"
+                  f"{row['Ours_mean']:>12.4f} +/- {ours_std:<5.4f}  ")
+
+        traj_csv = os.path.join(traj_out_dir, "experiment_results.csv")
+        traj_df.to_csv(traj_csv, index=False)
+        if start_trial > 0:
+            print(f"\n  Saved: {traj_csv}  "
+                  f"({start_trial} existing + {num_trials - start_trial} new = "
+                  f"{num_trials} trials total)")
+        else:
+            print(f"\n  Saved: {traj_csv}  ({num_trials} trials total)")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Run LLC experiment with optional resume support"
+    )
+    parser.add_argument(
+        '--resume', type=str, default=None,
+        help='Resume from an existing output directory '
+             '(e.g. outputs/main_experiment_20260619_125458)'
+    )
+    parser.add_argument(
+        '--start-trial', type=int, default=0,
+        help='Trial index to start from (0-based, default: 0). '
+             'In resume mode, loads existing trials before this index. '
+             'In normal mode, overrides the default start of 0.'
+    )
+    args = parser.parse_args()
+
+    if args.resume:
+        # ── Resume mode ──────────────────────────────────────────
+        resume_experiment(args.resume, args.start_trial)
+
+    else:
+        # ── Normal (fresh) mode ──────────────────────────────────
+        experiments_list = ["4-2-1"]
+        for experiment_name in experiments_list:
+
+            experiment_settings = json.load(open("experiment_settings.json"))
+
+            print()
+            print(f"Running {experiment_name}...")
+
+            config = experiment_settings[experiment_name]
+
+            config['t'] = config['n'] * config['beta']
+            config['lr'] = config['base_lr'] / config['t']
+            config['experiment_name'] = experiment_name
+            if 'device' not in config:
+                config['device'] = "cuda" if torch.cuda.is_available() else "cpu"
+
+            num_trajectories = config.get('num_trajectories', 1)
+            num_trials = config.get('num_trials', 5)
+            run_experiment(config, num_trajectories, num_trials)
