@@ -5,6 +5,7 @@ import random
 import numpy as np
 import torch
 from src.models import MlpModel
+from src.provenance import write_run_manifest
 from src.train_dataset import train_mnist_checkpoints
 
 
@@ -24,6 +25,7 @@ def run_single_trial(config, num_trial):
     checkpoint_dir = os.path.join(trial_dir, "mnist_checkpoints")
     os.makedirs(trial_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
+    write_run_manifest(trial_dir, config, seeds=[num_trial], source_root=".")
 
     model = MlpModel(root="./data", config=config)
     checkpoints = train_mnist_checkpoints(
@@ -62,8 +64,10 @@ if __name__ == "__main__":
 
         config = experiment_settings[experiment_name]
 
-        if "device" not in config:
+        if config.get("device", "auto") == "auto":
             config["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+        elif str(config["device"]).startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError("The configuration requests CUDA, but CUDA is unavailable.")
 
         num_trials = config.get("num_trials", 5)
         run_experiment(config, num_trials)

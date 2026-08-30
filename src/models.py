@@ -49,7 +49,7 @@ class MlpModel:
             pointer += numel
         return params
 
-    def evaluate(self, theta, N=64):
+    def evaluate(self, theta, N=64, generator=None):
         """Evaluate the model on N independent mini-batches.
 
         Returns:
@@ -64,7 +64,8 @@ class MlpModel:
             low=0,
             high=self.num_samples,
             size=(N, B),
-            device=self.device
+            device=self.device,
+            generator=generator,
         )
         flat_indices = indices.reshape(-1)
         X = self.X[flat_indices]
@@ -84,17 +85,66 @@ class MlpModel:
         )
         return group_losses, true_loss
 
-    def get_gradient(self, theta):
+    def get_gradient(self, theta, generator=None):
         """Compute the gradient of empirical loss w.r.t. theta on a single mini-batch."""
         theta = theta.detach().clone().to(self.device).requires_grad_(True)
         params = self._theta_to_params(theta)
-        indices = torch.randint(0, self.num_samples, (self.grad_batch_size,), device=self.device)
+        indices = torch.randint(
+            0,
+            self.num_samples,
+            (self.grad_batch_size,),
+            device=self.device,
+            generator=generator,
+        )
         X = self.X[indices]
         Y = self.Y[indices]
         logits = torch.func.functional_call(self.model, params, (X,))
         loss = torch.nn.functional.cross_entropy(logits, Y, reduction='mean')
         grad = torch.autograd.grad(loss, theta)[0]
         return grad.detach()
+
+    def estimate_gradient(self, theta, num_batches=4, generator=None):
+        """Average independent mini-batch gradients at a fixed checkpoint.
+
+        This legacy stochastic diagnostic has an upward noise floor after
+        squaring its norm. New paper runs use ``estimate_full_gradient``.
+        """
+        if num_batches < 1:
+            raise ValueError("num_batches must be positive.")
+        gradients = [
+            self.get_gradient(theta, generator=generator)
+            for _ in range(num_batches)
+        ]
+        return torch.stack(gradients, dim=0).mean(dim=0)
+
+    def estimate_full_gradient(self, theta, batch_size=1024):
+        """Return the gradient of the full empirical training loss.
+
+        The dataset is traversed deterministically in memory-bounded batches.
+        Accumulating gradients of summed losses and dividing once by the total
+        sample count is equivalent to differentiating the full-data mean.
+        """
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive.")
+
+        theta = theta.detach().clone().to(self.device)
+        gradient_sum = torch.zeros_like(theta)
+        for start in range(0, self.num_samples, batch_size):
+            stop = min(start + batch_size, self.num_samples)
+            theta_batch = theta.detach().clone().requires_grad_(True)
+            params = self._theta_to_params(theta_batch)
+            logits = torch.func.functional_call(
+                self.model,
+                params,
+                (self.X[start:stop],),
+            )
+            loss_sum = torch.nn.functional.cross_entropy(
+                logits,
+                self.Y[start:stop],
+                reduction='sum',
+            )
+            gradient_sum.add_(torch.autograd.grad(loss_sum, theta_batch)[0].detach())
+        return gradient_sum / self.num_samples
 
     class MlpNet(torch.nn.Module):
         def __init__(self, input_dim=784, hidden_dim=128, output_dim=10):
@@ -122,7 +172,7 @@ class SingularToyModel:
         self.noise_std = noise_std
         self.multiplicity = multiplicity
 
-    def evaluate(self, theta, N=1):
+    def evaluate(self, theta, N=1, generator=None):
         """Compute loss with simulated mini-batch noise.
 
         theta: (2,) tensor [u, v].
@@ -133,11 +183,16 @@ class SingularToyModel:
         else:
             true_loss = self.L0 + (theta[0] ** 2) * (theta[1] ** 2)
 
-        noise = torch.randn(N, device=theta.device, dtype=theta.dtype) * self.noise_std
+        noise = torch.randn(
+            N,
+            device=theta.device,
+            dtype=theta.dtype,
+            generator=generator,
+        ) * self.noise_std
         noisy_loss = true_loss + noise
         return noisy_loss, true_loss
 
-    def get_gradient(self, theta, noisy=False):
+    def get_gradient(self, theta, noisy=False, generator=None):
         """Compute gradient of the true loss w.r.t. theta via autograd.
 
         noisy=True for stochastic gradient is not yet implemented.
@@ -145,7 +200,11 @@ class SingularToyModel:
         if noisy:
             raise NotImplementedError("Noisy gradient is not implemented yet")
 
+        del generator
         theta_with_grad = theta.detach().clone().requires_grad_(True)
-        loss = self.evaluate(theta_with_grad)[1]
+        if self.multiplicity == 1:
+            loss = self.L0 + theta_with_grad[0] ** 2
+        else:
+            loss = self.L0 + theta_with_grad[0] ** 2 * theta_with_grad[1] ** 2
         loss.backward()
         return theta_with_grad.grad.detach()

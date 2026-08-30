@@ -5,9 +5,11 @@ import json
 from tqdm import tqdm
 from src.models import SingularToyModel
 from src.sampler import run_localized_sgld
+from src.config import resolve_sgld_config
 from src.estimators import (
     compute_llc_oracle_mean,
-    compute_llc_debiased_variance
+    compute_sive_unclipped,
+    compute_sive_clipped,
 )
 
 
@@ -30,11 +32,13 @@ def run_single_trial(config):
     sgld_history = run_localized_sgld(model, init_theta, config)
 
     oracle = compute_llc_oracle_mean(sgld_history, config, model.L0)
-    ours = compute_llc_debiased_variance(sgld_history, config)
+    sive_unclipped = compute_sive_unclipped(sgld_history, config)
+    sive_clipped = compute_sive_clipped(sgld_history, config)
     return {
         'oracle': oracle,
-        'ours': ours,
-        'diff': oracle - ours
+        'sive_unclipped': sive_unclipped,
+        'sive_clipped': sive_clipped,
+        'diff': oracle - sive_unclipped,
     }
 
 
@@ -42,7 +46,8 @@ def run_experiment(config, num_trials):
     """Run multiple trials and return per-estimator mean +/- std stats."""
     results = {
         'oracle': [],
-        'ours': [],
+        'sive_unclipped': [],
+        'sive_clipped': [],
         'diff': []
     }
 
@@ -71,9 +76,7 @@ if __name__ == "__main__":
         print("Running Appendix C.1: Localization sensitivity to h...")
 
         experiment_settings = json.load(open("experiment_settings.json"))
-        config = experiment_settings["appendix_c_1"]
-        config['t'] = config['n'] * config['beta']
-        config['lr'] = config['base_lr'] / config['t']
+        config = resolve_sgld_config(experiment_settings["appendix_c_1"])
 
         print(f"config: {config}")
         h_list = [0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50]
@@ -82,14 +85,15 @@ if __name__ == "__main__":
 
         print()
         print("-" * 65)
-        print(f"{'h':>8}  {'Oracle Mean-based':>27}  {'Debiased Variance':>27}")
+        print(f"{'h':>8}  {'Oracle Mean-based':>27}  {'SIVE unclip':>27}  {'SIVE clip':>27}")
         print("-" * 65)
 
         for h in h_list:
             config['h'] = h
             stats = run_experiment(config, num_trials)
             print(f"{h:>8.2f}  {stats['oracle']['mean']:>18.4f} +/- {stats['oracle']['std']:<5.4f}"
-                  f"  {stats['ours']['mean']:>18.4f} +/- {stats['ours']['std']:<5.4f}")
+                  f"  {stats['sive_unclipped']['mean']:>18.4f} +/- {stats['sive_unclipped']['std']:<5.4f}"
+                  f"  {stats['sive_clipped']['mean']:>18.4f} +/- {stats['sive_clipped']['std']:<5.4f}")
 
         print("-" * 65)
 
@@ -107,8 +111,7 @@ if __name__ == "__main__":
         else:
             raise ValueError(f"Unknown variable name: {variable_name}")
 
-        config['t'] = config['n'] * config['beta']
-        config['lr'] = config['base_lr'] / config['t']
+        config = resolve_sgld_config(config)
 
         print(f"config: {config}")
         print(f"lr_list: {lr_list}")
@@ -116,7 +119,7 @@ if __name__ == "__main__":
 
         print()
         print("-" * 65)
-        print(f"{'base_lr':>8}  {'Oracle Mean-based':>27}  {'Debiased Variance':>27}")
+        print(f"{'base_lr':>8}  {'Oracle Mean-based':>27}  {'SIVE unclip':>27}  {'SIVE clip':>27}")
         print("-" * 65)
 
         for lr in lr_list:
@@ -124,7 +127,8 @@ if __name__ == "__main__":
             config['lr'] = config['base_lr'] / config['t']
             stats = run_experiment(config, num_trials)
             print(f"{lr:>8.5f}  {stats['oracle']['mean']:>18.4f} +/- {stats['oracle']['std']:<5.4f}"
-                  f"  {stats['ours']['mean']:>18.4f} +/- {stats['ours']['std']:<5.4f}")
+                  f"  {stats['sive_unclipped']['mean']:>18.4f} +/- {stats['sive_unclipped']['std']:<5.4f}"
+                  f"  {stats['sive_clipped']['mean']:>18.4f} +/- {stats['sive_clipped']['std']:<5.4f}")
 
         print("-" * 65)
 
@@ -133,9 +137,7 @@ if __name__ == "__main__":
         print("Running Appendix C.4: Localization sensitivity to N...")
 
         experiment_settings = json.load(open("experiment_settings.json"))
-        config = experiment_settings["appendix_c_1"]
-        config['t'] = config['n'] * config['beta']
-        config['lr'] = config['base_lr'] / config['t']
+        config = resolve_sgld_config(experiment_settings["appendix_c_1"])
 
         print(f"config: {config}")
         print(f"N_list: {N_list}")
@@ -143,14 +145,15 @@ if __name__ == "__main__":
 
         print()
         print("-" * 95)
-        print(f"{'N':>8}  {'Oracle Mean-based':>27}  {'Debiased Variance':>27}  {'Delta (Oracle - Ours)':>27}")
+        print(f"{'N':>8}  {'Oracle Mean-based':>27}  {'SIVE unclip':>27}  {'SIVE clip':>27}  {'Delta (Oracle - unclip)':>27}")
         print("-" * 95)
 
         for N in N_list:
             config['N'] = N
             stats = run_experiment(config, num_trials)
             print(f"{N:>8}  {stats['oracle']['mean']:>18.4f} +/- {stats['oracle']['std']:<5.4f}"
-                  f"  {stats['ours']['mean']:>18.4f} +/- {stats['ours']['std']:<5.4f}"
+                  f"  {stats['sive_unclipped']['mean']:>18.4f} +/- {stats['sive_unclipped']['std']:<5.4f}"
+                  f"  {stats['sive_clipped']['mean']:>18.4f} +/- {stats['sive_clipped']['std']:<5.4f}"
                   f"  {stats['diff']['mean']:>18.4f} +/- {stats['diff']['std']:<5.4f}")
 
         print("-" * 95)

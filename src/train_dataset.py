@@ -17,11 +17,14 @@ def train_mnist_checkpoints(probe_model, maxi_epochs=20, lr=0.1, root='./data',
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=64, shuffle=True
     )
+    train_eval_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=256, shuffle=False
+    )
     test_dataset = torchvision.datasets.MNIST(
         root=root, train=False, download=True, transform=torchvision.transforms.ToTensor()
     )
     test_loader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=64, shuffle=False
+        test_dataset, batch_size=256, shuffle=False
     )
     os.makedirs(output_dir, exist_ok=True)
     model = probe_model.model
@@ -40,13 +43,26 @@ def train_mnist_checkpoints(probe_model, maxi_epochs=20, lr=0.1, root='./data',
         checkpoints[epoch] = path
         print(f"[Checkpoint] epoch={epoch}, path={path}")
 
-    save_ckpt(0, 0.0, 0.0)
+    def evaluate_loss(data_loader):
+        """Evaluate the loss of the current checkpoint parameters."""
+        model.eval()
+        total_loss = 0.0
+        total_samples = 0
+        with torch.no_grad():
+            for x, y in data_loader:
+                x = x.to(probe_model.device)
+                y = y.to(probe_model.device)
+                logits = model(x)
+                loss = torch.nn.functional.cross_entropy(logits, y)
+                total_loss += loss.item() * x.size(0)
+                total_samples += x.size(0)
+        return total_loss / total_samples
+
+    # Epoch 0 is a real evaluated checkpoint, not a placeholder zero.
+    save_ckpt(0, evaluate_loss(train_eval_loader), evaluate_loss(test_loader))
 
     for epoch in range(1, maxi_epochs + 1):
         model.train()
-        total_train_loss = 0.0
-        train_samples = 0
-
         for x, y in train_loader:
             x = x.to(probe_model.device)
             y = y.to(probe_model.device)
@@ -56,24 +72,10 @@ def train_mnist_checkpoints(probe_model, maxi_epochs=20, lr=0.1, root='./data',
             loss.backward()
             optimizer.step()
 
-            total_train_loss += loss.item() * x.size(0)
-            train_samples += x.size(0)
-
-        epoch_train_loss = total_train_loss / train_samples
-
-        model.eval()
-        total_test_loss = 0.0
-        test_samples = 0
-        with torch.no_grad():
-            for x, y in test_loader:
-                x = x.to(probe_model.device)
-                y = y.to(probe_model.device)
-                test_logits = model(x)
-                test_loss = torch.nn.functional.cross_entropy(test_logits, y)
-                total_test_loss += test_loss.item() * x.size(0)
-                test_samples += x.size(0)
-
-        epoch_test_loss = total_test_loss / test_samples
+        # Evaluate both datasets at the saved endpoint parameters.  The old
+        # logger mixed an in-epoch running training loss with endpoint test loss.
+        epoch_train_loss = evaluate_loss(train_eval_loader)
+        epoch_test_loss = evaluate_loss(test_loader)
 
         print(f"[Epoch {epoch}] Train Loss: {epoch_train_loss} Test Loss: {epoch_test_loss}")
 

@@ -13,7 +13,7 @@ def _compute_trial_stats(exp_dir):
     """Read all raw trial CSVs and return per-epoch stats + loss data.
 
     Returns:
-        trials_by_epoch: {epoch: {'Online': [values], 'Ours': [...], 'Retrospective': [...]}}
+        trials_by_epoch: {epoch: {'Online': [...], 'SIVE': [...], 'Retrospective': [...]}}
         loss_by_epoch:   {epoch: (train_loss, test_loss)}
     """
     traj_dir = Path(exp_dir) / "trajectory_0"
@@ -23,12 +23,13 @@ def _compute_trial_stats(exp_dir):
     loss_by_epoch = {}
     for f in raw_files:
         tdf = pd.read_csv(f)
+        sive_column = "SIVE_unclipped" if "SIVE_unclipped" in tdf else "Ours"
         for _, row in tdf.iterrows():
             ep = int(row["Epoch"])
             if ep not in trials_by_epoch:
-                trials_by_epoch[ep] = {"Online": [], "Ours": [], "Retrospective": []}
+                trials_by_epoch[ep] = {"Online": [], "SIVE": [], "Retrospective": []}
             trials_by_epoch[ep]["Online"].append(row["Online"])
-            trials_by_epoch[ep]["Ours"].append(row["Ours"])
+            trials_by_epoch[ep]["SIVE"].append(row[sive_column])
             trials_by_epoch[ep]["Retrospective"].append(row["Retrospective"])
             if ep not in loss_by_epoch:
                 loss_by_epoch[ep] = (row["Train_Loss"], row["Test_Loss"])
@@ -61,7 +62,7 @@ def load_and_print_trial_table(exp_dir):
     # ── Plain-text table (skip epoch 0) ──────────────────────────
     print(f"\n  Based on {n_trials} trials from: {exp_dir}")
     header = (f"  {'Epoch':>6}  {'TrainLoss':>10}  {'TestLoss':>10}  "
-              f"{'Online':>22} {'Retrospective':>22} {'Ours':>22}")
+              f"{'Online':>22} {'Retrospective':>22} {'SIVE-unclipped':>22}")
     print(header)
     print("-" * len(header))
     for ep in epochs:
@@ -71,7 +72,7 @@ def load_and_print_trial_table(exp_dir):
         tl, tstl = loss_by_epoch.get(ep, (float("nan"), float("nan")))
         on_m, on_s = _fmt_mean_std(d["Online"])
         ret_m, ret_s = _fmt_mean_std(d["Retrospective"])
-        our_m, our_s = _fmt_mean_std(d["Ours"])
+        our_m, our_s = _fmt_mean_std(d["SIVE"])
         print(f"  {ep:>6}  "
               f"{tl:>10.4f}  {tstl:>10.4f}  "
               f"{on_m:>12.4f} +/- {on_s:<5.4f}  "
@@ -82,13 +83,13 @@ def load_and_print_trial_table(exp_dir):
     # ── LaTeX table (all epochs, including 0) ─────────────────────
     tex_lines = []
     tex_lines.append("% LaTeX table — copy into your document")
-    tex_lines.append("% Columns: Epoch  TrainLoss  TestLoss  Online  Retrospective  Ours")
+    tex_lines.append("% Columns: Epoch  TrainLoss  TestLoss  Online  Retrospective  SIVE-unclipped")
     for ep in epochs:
         d = trials_by_epoch[ep]
         tl, tstl = loss_by_epoch.get(ep, (float("nan"), float("nan")))
         on_m, on_s = _fmt_mean_std(d["Online"])
         ret_m, ret_s = _fmt_mean_std(d["Retrospective"])
-        our_m, our_s = _fmt_mean_std(d["Ours"])
+        our_m, our_s = _fmt_mean_std(d["SIVE"])
         tex_lines.append(
             f"  {ep} & {tl:.4f} & {tstl:.4f} & "
             f"${on_m:.4f} \\pm {on_s:.4f}$ & "
@@ -120,7 +121,7 @@ if __name__ == "__main__":
     epoch = df["Epoch"]
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 7), sharex=True)
-    (ax_loss, ax_loss_log), (ax_llc, ax_llc_log) = axes
+    (ax_loss, ax_loss_log), (ax_probe, ax_probe_scale) = axes
 
     # ---- Top-left: Loss (original) ----
     ax_loss.plot(epoch, df["Train_Loss"], color="tab:blue", label="Train Loss")
@@ -137,35 +138,55 @@ if __name__ == "__main__":
     ax_loss_log.legend(loc="upper right")
     ax_loss_log.grid(True, alpha=0.3)
 
-    # ---- Bottom-left: LLC (original) ----
+    # ---- Bottom-left: finite-scale probes ----
     def plot_with_shade(ax, x, mean_col, std_col, color, label):
         mean = df[mean_col]
         std = df[std_col]
         ax.plot(x, mean, color=color, label=label)
         ax.fill_between(x, mean - std, mean + std, color=color, alpha=0.2)
 
-    plot_with_shade(ax_llc, epoch, "Online_mean", "Online_std", "tab:green", "Online")
-    plot_with_shade(ax_llc, epoch, "Retrospective_mean", "Retrospective_std", "tab:red", "Retrospective")
-    plot_with_shade(ax_llc, epoch, "Ours_mean", "Ours_std", "tab:purple", "SIVE")
-    ax_llc.set_ylabel("LLC")
-    ax_llc.legend(loc="upper right")
-    ax_llc.grid(True, alpha=0.3)
+    sive_mean = "SIVE_unclipped_mean" if "SIVE_unclipped_mean" in df else "Ours_mean"
+    sive_std = "SIVE_unclipped_std" if "SIVE_unclipped_std" in df else "Ours_std"
+    plot_with_shade(ax_probe, epoch, "Online_mean", "Online_std", "tab:green", "Online")
+    plot_with_shade(ax_probe, epoch, "Retrospective_mean", "Retrospective_std", "tab:red", "Retrospective")
+    if "Raw_Variance_mean" in df:
+        plot_with_shade(
+            ax_probe,
+            epoch,
+            "Raw_Variance_mean",
+            "Raw_Variance_std",
+            "tab:gray",
+            "Raw variance",
+        )
+    plot_with_shade(ax_probe, epoch, sive_mean, sive_std, "tab:purple", "SIVE (unclipped)")
+    ax_probe.set_ylabel("Finite-scale probe")
+    ax_probe.legend(loc="upper right")
+    ax_probe.grid(True, alpha=0.3)
 
-    # ---- Bottom-right: LLC (log) ----
-    plot_with_shade(ax_llc_log, epoch, "Online_mean", "Online_std", "tab:green", "Online")
-    plot_with_shade(ax_llc_log, epoch, "Retrospective_mean", "Retrospective_std", "tab:red", "Retrospective")
-    plot_with_shade(ax_llc_log, epoch, "Ours_mean", "Ours_std", "tab:purple", "SIVE")
-    ax_llc_log.set_ylabel("LLC (log scale)")
-    ax_llc_log.set_yscale("log")
-    ax_llc_log.legend(loc="upper right")
-    ax_llc_log.grid(True, alpha=0.3)
+    # Symlog remains defined if the unbiased finite-path statistic is negative.
+    plot_with_shade(ax_probe_scale, epoch, "Online_mean", "Online_std", "tab:green", "Online")
+    plot_with_shade(ax_probe_scale, epoch, "Retrospective_mean", "Retrospective_std", "tab:red", "Retrospective")
+    if "Raw_Variance_mean" in df:
+        plot_with_shade(
+            ax_probe_scale,
+            epoch,
+            "Raw_Variance_mean",
+            "Raw_Variance_std",
+            "tab:gray",
+            "Raw variance",
+        )
+    plot_with_shade(ax_probe_scale, epoch, sive_mean, sive_std, "tab:purple", "SIVE (unclipped)")
+    ax_probe_scale.set_ylabel("Finite-scale probe (symlog)")
+    ax_probe_scale.set_yscale("symlog", linthresh=1.0)
+    ax_probe_scale.legend(loc="upper right")
+    ax_probe_scale.grid(True, alpha=0.3)
 
     # Shared x labels for bottom row
-    ax_llc.set_xlabel("Epoch")
-    ax_llc_log.set_xlabel("Epoch")
+    ax_probe.set_xlabel("Epoch")
+    ax_probe_scale.set_xlabel("Epoch")
 
     plt.tight_layout()
     out_path = Path(exp_dir) / "trajectory_0" / "experiment_results.pdf"
     fig.savefig(out_path, dpi=200)
     print(f"Saved to {out_path} (dpi=200)")
-    plt.show()
+    plt.close(fig)

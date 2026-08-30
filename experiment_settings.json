@@ -1,8 +1,8 @@
 {
   "appendix_c_1": {
+    "schema_version": 2,
     "model": "Toy",
-    "beta": 1.0,
-    "n": 10000,
+    "t": 10000,
     "h": 2.0,
     "base_lr": 0.05,
     "M": 100000,
@@ -15,9 +15,9 @@
     "init_theta": [0.2, 0.2]
   },
   "4-1-1": {
+    "schema_version": 2,
     "model": "Toy",
-    "beta": 1.0,
-    "n": 10000,
+    "t": 10000,
     "h": 2.0,
     "base_lr": 0.05,
     "M": 100000,
@@ -30,9 +30,9 @@
     "init_theta": [0.2, 0.2]
   },
   "4-1-2": {
+    "schema_version": 2,
     "model": "Toy",
-    "beta": 1.0,
-    "n": 10000,
+    "t": 10000,
     "h": 2.0,
     "base_lr": 0.05,
     "M": 100000,
@@ -45,10 +45,10 @@
     "init_theta": [0.2, 0.2]
   },
   "4-2-1": {
+    "schema_version": 2,
     "model": "Mlp",
-    "beta": 1.0,
-    "n": 10000,
-    "h": 2.0,
+    "t": 10000,
+    "c_h": 1.0,
     "base_lr": 0.05,
     "M": 100000,
     "N": 512,
@@ -57,13 +57,26 @@
     "apply_burn_in": true,
     "burn_in_ratio": 0.3,
     "checkpoint_interval": 1,
-    "device": "cuda"
+    "full_gradient_batch_size": 1024,
+    "record_linear_detrending": true,
+    "probe_rng_stream_version": 1,
+    "num_trajectories": 1,
+    "num_trials": 5,
+    "device": "auto"
+  },
+  "dnn_h_sweep": {
+    "base_experiment": "4-2-1",
+    "c_h_values": [0.5, 1.0, 2.0, 4.0],
+    "checkpoint_epochs": [1, 40, 100],
+    "num_trials": 5
   },
   "mlp_trajectories": {
+    "schema_version": 2,
     "model": "Mlp",
-    "train_epochs": 300,
+    "train_epochs": 100,
     "train_lr": 0.01,
     "checkpoint_interval": 1,
-    "device": "cuda"
+    "num_trials": 1,
+    "device": "auto"
   }
 }

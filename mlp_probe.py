@@ -1,164 +1,160 @@
-import os
+"""Run the paired multi-scale audit on selected MNIST checkpoints."""
+
 import json
+import os
 from datetime import datetime
 
-import torch
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+from mlp_experiment_run import (
+    METRICS,
+    discover_checkpoints,
+    prepare_config,
+    run_single_sgld,
+    save_trial,
+)
 from src.models import MlpModel
-from src.sampler import run_localized_sgld
-from src.estimators import compute_llc_naive_mean, compute_llc_debiased_variance
-
-CHECKPOINT_DIR = "outputs/trajectory_0/mnist_checkpoints"
-EPOCH_CHECK_LIST = [1, 29, 100]
-additional_setting_set = {
-    'h': [0.1, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0],
-}
+from src.provenance import write_run_manifest
 
 
-def get_config():
-    with open("experiment_settings.json") as f:
-        settings = json.load(f)
-    config = settings["4-2-1"]
-    config['t'] = config['n'] * config['beta']
-    config['lr'] = config['base_lr'] / config['t']
-    if 'device' not in config:
-        config['device'] = "cuda" if torch.cuda.is_available() else "cpu"
-    return config
+def format_scale(value):
+    return str(value).replace("-", "m").replace(".", "p")
 
 
-def print_segment_llc(sgld_history, config, epoch, n_segments=10):
-    if n_segments <= 0:
-        raise ValueError("n_segments must be positive.")
-
-    L_bar = np.asarray(sgld_history['L_bar_m'])
-    s2 = np.asarray(sgld_history['s2_m'])
-    L_true = np.asarray(sgld_history['L_true_m'])
-    seg_len = len(L_bar) // n_segments
-    if seg_len == 0:
-        raise ValueError("SGLD history is shorter than the requested number of segments.")
-
-    segment_config = config.copy()
-    segment_config['apply_burn_in'] = False
-    naive_llcs = []
-    ours_llcs = []
-    means = []
-    variances = []
-    for i in range(n_segments):
-        seg = {
-            'L_bar_m': L_bar[i * seg_len:(i + 1) * seg_len],
-            's2_m': s2[i * seg_len:(i + 1) * seg_len],
-            'L_true_m': L_true[i * seg_len:(i + 1) * seg_len],
-        }
-        naive_llcs.append(compute_llc_naive_mean(seg, segment_config))
-        ours_llcs.append(compute_llc_debiased_variance(seg, segment_config))
-        means.append(np.mean(seg['L_bar_m']))
-        variances.append(np.var(seg['L_bar_m']))
-
-    print(f"\n=== Epoch {epoch:>3} per-segment LLC ===")
-    for row in range(2):
-        idx = row * 5
-        cells = [f"  mean={means[i]:.4f}, var={variances[i]:.6f}  " for i in range(idx, idx + 5)]
-        label = f"  seg{idx}-{idx+4}  |"
-        print(label + "".join(cells))
-    cells_naive = "".join(f"  {v:>8.4f}" for v in naive_llcs)
-    print("  naive |" + cells_naive)
-    cells_ours = "".join(f"  {v:>8.4f}" for v in ours_llcs)
-    print("  ours  |" + cells_ours)
-
-
-def build_run_configs(base_config):
-    """Zip param lists sequentially (not Cartesian product)."""
-    keys = list(additional_setting_set.keys())
-    values = list(additional_setting_set.values())
-    lengths = {len(v) for v in values}
-    if len(lengths) > 1:
-        raise ValueError(f"All param lists must have same length for sequential sweep, got {lengths}")
-    n = lengths.pop()
-    configs = []
-    for i in range(n):
-        cfg = base_config.copy()
-        for k, v_list in zip(keys, values):
-            cfg[k] = v_list[i]
-        configs.append((f"run_{i}", cfg))
-    return configs
-
-
-def probe_checkpoints(model, checkpoints, config, out_dir):
-    hist_dir = os.path.join(out_dir, "sgld_histories")
-    os.makedirs(hist_dir, exist_ok=True)
+def summarize_sweep(rows):
+    frame = pd.DataFrame(rows)
     summary_rows = []
+    for (c_h, epoch), group in frame.groupby(["c_h", "Epoch"], sort=True):
+        row = {
+            "c_h": c_h,
+            "Epoch": int(epoch),
+            "Train_Loss": group["Train_Loss"].iloc[0],
+            "Test_Loss": group["Test_Loss"].iloc[0],
+        }
+        for metric in METRICS:
+            values = group[metric].dropna().to_numpy()
+            row[f"{metric}_mean"] = float(np.mean(values)) if len(values) else float("nan")
+            row[f"{metric}_std"] = (
+                float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+            )
+        for metric in ("SIVE_unclipped", "SIVE_detrended_unclipped"):
+            values = group[metric].dropna().to_numpy()
+            if len(values) == 0:
+                continue
+            row[f"{metric}_negative_fraction"] = float(np.mean(values < 0))
+            row[f"{metric}_min"] = float(np.min(values))
+            row[f"{metric}_q05"] = float(np.quantile(values, 0.05))
+            row[f"{metric}_median"] = float(np.median(values))
+            row[f"{metric}_q95"] = float(np.quantile(values, 0.95))
+        summary_rows.append(row)
+    return pd.DataFrame(summary_rows)
 
-    for epoch in sorted(checkpoints.keys()):
-        ckpt = torch.load(checkpoints[epoch], map_location=config['device'])
-        theta = ckpt['theta']
-        train_loss = ckpt['train_loss']
-        test_loss = ckpt['test_loss']
 
-        sgld_history = run_localized_sgld(model, theta, config)
+def paired_contrasts(rows, checkpoint_epochs):
+    """Compute prespecified early-middle and late-middle paired contrasts."""
+    early, middle, late = sorted(checkpoint_epochs)
+    frame = pd.DataFrame(rows)
+    contrast_rows = []
+    for (c_h, trial), group in frame.groupby(["c_h", "Trial"], sort=True):
+        by_epoch = group.set_index("Epoch")
+        row = {"c_h": c_h, "Trial": int(trial)}
+        for metric in ("SIVE_unclipped", "SIVE_detrended_unclipped"):
+            row[f"{metric}_D_drop"] = (
+                by_epoch.loc[early, metric] - by_epoch.loc[middle, metric]
+            )
+            row[f"{metric}_D_rebound"] = (
+                by_epoch.loc[late, metric] - by_epoch.loc[middle, metric]
+            )
+        contrast_rows.append(row)
+    raw = pd.DataFrame(contrast_rows)
 
-        naive = compute_llc_naive_mean(sgld_history, config)
-        ours = compute_llc_debiased_variance(sgld_history, config)
-
-        print_segment_llc(sgld_history, config, epoch)
-
-        hist_df = pd.DataFrame({
-            'step': range(len(sgld_history['L_bar_m'])),
-            'L_bar_m': sgld_history['L_bar_m'],
-            's2_m': sgld_history['s2_m'],
-            'L_true_m': sgld_history['L_true_m'],
-        })
-        hist_df.to_csv(os.path.join(hist_dir, f"epoch_{epoch:03d}.csv"), index=False)
-
-        summary_rows.append({
-            'Epoch': epoch,
-            'Train_Loss': train_loss,
-            'Test_Loss': test_loss,
-            'Naive': naive,
-            'Ours': ours,
-        })
-
-    summary_df = pd.DataFrame(summary_rows)
-    summary_df.to_csv(os.path.join(out_dir, "probe_summary.csv"), index=False)
-    return summary_df
+    summary_rows = []
+    value_columns = [
+        column for column in raw.columns if column not in {"c_h", "Trial"}
+    ]
+    for c_h, group in raw.groupby("c_h", sort=True):
+        row = {"c_h": c_h}
+        for column in value_columns:
+            values = group[column].dropna().to_numpy()
+            row[f"{column}_mean"] = float(np.mean(values))
+            row[f"{column}_std"] = (
+                float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+            )
+        summary_rows.append(row)
+    return raw, pd.DataFrame(summary_rows)
 
 
 def main():
-    base_config = get_config()
+    with open("experiment_settings.json", encoding="utf-8") as handle:
+        settings = json.load(handle)
 
-    checkpoints = {}
-    for epoch in EPOCH_CHECK_LIST:
-        path = os.path.join(CHECKPOINT_DIR, f"epoch_{epoch}.pt")
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Checkpoint not found: {path}")
-        checkpoints[epoch] = path
+    sweep = settings["dnn_h_sweep"]
+    base_name = sweep["base_experiment"]
+    base_config = prepare_config(settings[base_name])
+    c_h_values = sweep.get("c_h_values", sweep.get("h_values"))
+    if c_h_values is None:
+        raise KeyError("dnn_h_sweep must define 'c_h_values'.")
+    epochs = set(sweep["checkpoint_epochs"])
+    if len(epochs) != 3:
+        raise ValueError("The paired drop/rebound audit requires exactly three checkpoints.")
+    num_trials = int(sweep.get("num_trials", base_config.get("num_trials", 5)))
 
-    if not checkpoints:
-        raise FileNotFoundError(f"No checkpoint files found in {CHECKPOINT_DIR}")
+    all_checkpoints = discover_checkpoints(
+        "outputs/trajectory_0/mnist_checkpoints",
+        base_config.get("checkpoint_interval", 1),
+    )
+    checkpoints = {epoch: path for epoch, path in all_checkpoints.items() if epoch in epochs}
+    missing = epochs.difference(checkpoints)
+    if missing:
+        raise FileNotFoundError(f"Missing requested checkpoints: {sorted(missing)}")
 
-    run_configs = build_run_configs(base_config)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    sweep_dir = f"outputs/probe_sweep_{ts}"
-    os.makedirs(sweep_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    sweep_dir = f"outputs/dnn_h_sweep_{stamp}"
+    os.makedirs(sweep_dir, exist_ok=False)
+    write_run_manifest(
+        sweep_dir,
+        {"base_config": base_config, "sweep": sweep},
+        seeds=range(num_trials),
+        source_root=".",
+    )
 
-    model = MlpModel(root='./data', config=base_config)
+    model = MlpModel(root=base_config.get("data_root", "./data"), config=base_config)
+    combined_rows = []
+    for c_h in c_h_values:
+        config = dict(base_config)
+        config["c_h"] = float(c_h)
+        run_dir = os.path.join(sweep_dir, f"c_h_{format_scale(c_h)}")
+        os.makedirs(run_dir, exist_ok=False)
+        with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as handle:
+            json.dump(config, handle, indent=2, sort_keys=True)
 
-    all_summaries = []
-    for run_name, config in run_configs:
-        desc = ", ".join(f"{k}={config[k]}" for k in additional_setting_set)
-        print(f"\n{'='*60}\n{run_name}: {desc}\n{'='*60}")
+        for trial in tqdm(range(num_trials), desc=f"c_h={c_h}", unit="trial"):
+            rows, histories = run_single_sgld(config, checkpoints, trial, model)
+            for row in rows:
+                row["c_h"] = float(c_h)
+                row["Trial"] = trial
+            combined_rows.extend(rows)
+            save_trial(run_dir, trial, rows, histories)
 
-        run_dir = os.path.join(sweep_dir, run_name)
-        summary_df = probe_checkpoints(model, checkpoints, config, run_dir)
-        summary_df['run'] = run_name
-        all_summaries.append(summary_df)
-
-    combined = pd.concat(all_summaries, ignore_index=True)
-    combined.to_csv(os.path.join(sweep_dir, "sweep_summary.csv"), index=False)
-
-    print(f"\nDone. {len(run_configs)} runs x {len(checkpoints)} epochs.")
+    pd.DataFrame(combined_rows).to_csv(
+        os.path.join(sweep_dir, "sweep_raw.csv"), index=False
+    )
+    summary = summarize_sweep(combined_rows)
+    summary.to_csv(os.path.join(sweep_dir, "sweep_summary.csv"), index=False)
+    contrast_raw, contrast_summary = paired_contrasts(combined_rows, epochs)
+    contrast_raw.to_csv(
+        os.path.join(sweep_dir, "paired_contrasts_raw.csv"),
+        index=False,
+    )
+    contrast_summary.to_csv(
+        os.path.join(sweep_dir, "paired_contrasts_summary.csv"),
+        index=False,
+    )
+    print(summary.to_string(index=False))
+    print("\nPrespecified paired contrasts:")
+    print(contrast_summary.to_string(index=False))
     print(f"Output: {sweep_dir}")
 
 

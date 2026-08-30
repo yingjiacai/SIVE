@@ -5,11 +5,13 @@ import json
 from tqdm import tqdm
 from src.models import SingularToyModel
 from src.sampler import run_localized_sgld
+from src.config import resolve_sgld_config
 from src.estimators import (
     compute_llc_oracle_mean,
     compute_llc_naive_mean,
     compute_llc_raw_variance,
-    compute_llc_debiased_variance
+    compute_sive_unclipped,
+    compute_sive_clipped,
 )
 
 
@@ -22,7 +24,7 @@ def set_seed(seed):
 
 
 def run_single_trial(config):
-    """Run one SGLD trial and return LLC estimates from all estimators."""
+    """Run one SGLD trial and return finite-scale probe estimates."""
     if config['model'] == "Toy":
         model = SingularToyModel(L0=config['L0'], noise_std=config['eval_noisy'], multiplicity=config['multiplicity'])
         init_theta = torch.tensor(config['init_theta'])
@@ -35,7 +37,8 @@ def run_single_trial(config):
         'oracle': compute_llc_oracle_mean(sgld_history, config, model.L0),
         'naive': compute_llc_naive_mean(sgld_history, config),
         'raw_var': compute_llc_raw_variance(sgld_history, config),
-        'ours': compute_llc_debiased_variance(sgld_history, config)
+        'sive_unclipped': compute_sive_unclipped(sgld_history, config),
+        'sive_clipped': compute_sive_clipped(sgld_history, config),
     }
 
 
@@ -45,7 +48,8 @@ def run_experiment(config, num_trials):
         'oracle': [],
         'naive': [],
         'raw_var': [],
-        'ours': []
+        'sive_unclipped': [],
+        'sive_clipped': [],
     }
     print(f"Config: {config}")
     print(f"Running {num_trials} independent trials of Localized SGLD...")
@@ -69,7 +73,8 @@ def run_experiment(config, num_trials):
     print(f"1.  Oracle Mean-based        : {stats['oracle']['mean']:.4f} +/- {stats['oracle']['std']:.4f}")
     print(f"2.  Naive Mean-based         : {stats['naive']['mean']:.4f} +/- {stats['naive']['std']:.4f}")
     print(f"3.  Raw Variance-based       : {stats['raw_var']['mean']:.4f} +/- {stats['raw_var']['std']:.4f}")
-    print(f"4.  Debiased Variance        : {stats['ours']['mean']:.4f} +/- {stats['ours']['std']:.4f}")
+    print(f"4.  SIVE (unclipped)         : {stats['sive_unclipped']['mean']:.4f} +/- {stats['sive_unclipped']['std']:.4f}")
+    print(f"5.  SIVE (clipped safeguard) : {stats['sive_clipped']['mean']:.4f} +/- {stats['sive_clipped']['std']:.4f}")
     print("=" * 75)
 
 
@@ -77,8 +82,7 @@ if __name__ == "__main__":
     # Example config (see experiment_settings.json for actual settings):
     #
     # config = {
-    #     'beta': 1.0,               # inverse temperature
-    #     'n': 10000,                # effective sample size
+    #     't': 10000,                # explicit inverse-temperature scale
     #     'h': 2.0,                  # localization bandwidth
     #     'base_lr': 0.03,           # SGLD base learning rate (lr = base_lr / t)
     #     'M': 100000,               # MCMC steps
@@ -96,8 +100,6 @@ if __name__ == "__main__":
     for experiment_name in experiments_list:
         print()
         print(f"Running {experiment_name}...")
-        config = experiment_settings[experiment_name]
-        config['t'] = config['n'] * config['beta']
-        config['lr'] = config['base_lr'] / config['t']
+        config = resolve_sgld_config(experiment_settings[experiment_name])
         num_trials = 5
         run_experiment(config, num_trials)
