@@ -215,16 +215,18 @@ def run_single_sgld(config, checkpoints, seed, model, trajectory=0):
 
 
 def save_trial(traj_out_dir, trial, rows, histories):
-    pd.DataFrame(rows).to_csv(
-        os.path.join(traj_out_dir, f"raw_trial_{trial}.csv"), index=False
-    )
+    csv_path = os.path.join(traj_out_dir, f"raw_trial_{trial}.csv")
+    csv_tmp = f"{csv_path}.tmp"
+    pd.DataFrame(rows).to_csv(csv_tmp, index=False)
+    os.replace(csv_tmp, csv_path)
     arrays = {}
     for epoch, history in histories.items():
         for field, values in history.items():
             arrays[f"epoch_{epoch}_{field}"] = np.asarray(values)
-    np.savez_compressed(
-        os.path.join(traj_out_dir, f"sgld_trial_{trial}.npz"), **arrays
-    )
+    npz_path = os.path.join(traj_out_dir, f"sgld_trial_{trial}.npz")
+    npz_tmp = f"{npz_path}.tmp.npz"
+    np.savez_compressed(npz_tmp, **arrays)
+    os.replace(npz_tmp, npz_path)
 
 
 def read_sgld_npz(npz_path):
@@ -307,31 +309,45 @@ def print_summary(summary):
         )
 
 
-def run_experiment(config, output_dir=None, start_trial=0):
-    num_trajectories = config.get("num_trajectories", 1)
+def run_experiment(
+    config,
+    output_dir=None,
+    start_trial=0,
+    trajectory_ids=None,
+    checkpoint_root="outputs",
+):
+    if trajectory_ids is None:
+        trajectory_ids = range(config.get("num_trajectories", 1))
     num_trials = config.get("num_trials", 5)
+    probe_seeds = config.get("probe_seeds", list(range(num_trials)))
 
     if output_dir is None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = f"outputs/main_experiment_{stamp}"
         os.makedirs(output_dir, exist_ok=False)
+    else:
+        os.makedirs(output_dir, exist_ok=True)
+
+    config_path = os.path.join(output_dir, "config.json")
+    if not os.path.exists(config_path):
         with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as handle:
             json.dump(config, handle, indent=2, sort_keys=True)
         write_run_manifest(
             output_dir,
             config,
-            seeds=range(num_trials),
+            seeds=probe_seeds,
             source_root=os.path.dirname(os.path.abspath(__file__)),
         )
-    elif not os.path.isdir(output_dir):
-        raise FileNotFoundError(f"Output directory not found: {output_dir}")
-
     print(f"Config: {config}")
     print(f"Output: {output_dir}")
 
     model = MlpModel(root=config.get("data_root", "./data"), config=config)
-    for trajectory in range(num_trajectories):
-        checkpoint_dir = f"outputs/trajectory_{trajectory}/mnist_checkpoints"
+    for trajectory in trajectory_ids:
+        checkpoint_dir = os.path.join(
+            checkpoint_root,
+            f"trajectory_{trajectory}",
+            "mnist_checkpoints",
+        )
         checkpoints = discover_checkpoints(
             checkpoint_dir, config.get("checkpoint_interval", 1)
         )
@@ -339,10 +355,15 @@ def run_experiment(config, output_dir=None, start_trial=0):
         os.makedirs(traj_out_dir, exist_ok=True)
 
         for trial in tqdm(
-            range(start_trial, num_trials),
+            probe_seeds[start_trial:],
             desc=f"Trajectory {trajectory} trials",
             unit="trial",
         ):
+            raw_path = os.path.join(traj_out_dir, f"raw_trial_{trial}.csv")
+            trace_path = os.path.join(traj_out_dir, f"sgld_trial_{trial}.npz")
+            if os.path.exists(raw_path) and os.path.exists(trace_path):
+                print(f"Skipping completed trajectory {trajectory}, trial {trial}")
+                continue
             rows, histories = run_single_sgld(
                 config,
                 checkpoints,
@@ -350,6 +371,9 @@ def run_experiment(config, output_dir=None, start_trial=0):
                 model,
                 trajectory=trajectory,
             )
+            for row in rows:
+                row["Training_Seed"] = trajectory
+                row["Probe_Trial"] = trial
             save_trial(traj_out_dir, trial, rows, histories)
 
         summary = summarize_trials(traj_out_dir)
@@ -362,20 +386,37 @@ def run_experiment(config, output_dir=None, start_trial=0):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--resume", default=None, help="Existing output directory")
+    parser.add_argument("--output-dir", help="Output directory for a new or resumed run")
+    parser.add_argument("--checkpoint-root", default="outputs")
+    parser.add_argument("--trajectories", nargs="+", type=int)
     parser.add_argument("--start-trial", type=int, default=0)
     args = parser.parse_args()
+    if args.resume and args.output_dir:
+        parser.error("use either --resume or --output-dir, not both")
 
     if args.resume:
         with open(os.path.join(args.resume, "config.json"), encoding="utf-8") as handle:
             config = prepare_config(json.load(handle))
-        run_experiment(config, output_dir=args.resume, start_trial=args.start_trial)
+        run_experiment(
+            config,
+            output_dir=args.resume,
+            start_trial=args.start_trial,
+            trajectory_ids=args.trajectories,
+            checkpoint_root=args.checkpoint_root,
+        )
         return
 
     with open("experiment_settings.json", encoding="utf-8") as handle:
         settings = json.load(handle)
     config = prepare_config(settings["4-2-1"])
     config["experiment_name"] = "4-2-1"
-    run_experiment(config, start_trial=args.start_trial)
+    run_experiment(
+        config,
+        output_dir=args.output_dir,
+        start_trial=args.start_trial,
+        trajectory_ids=args.trajectories,
+        checkpoint_root=args.checkpoint_root,
+    )
 
 
 if __name__ == "__main__":

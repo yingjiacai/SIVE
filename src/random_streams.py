@@ -3,25 +3,23 @@
 import torch
 
 
-_MAX_SEED = 2**63 - 1
-_STREAM_OFFSETS = {
-    "gradient": 104_729,
-    "langevin": 130_363,
-    "evaluation": 155_921,
+_STREAM_IDS = {
+    "gradient": 0,
+    "langevin": 1,
+    "evaluation": 2,
 }
 
 
 def derive_probe_seed(base_seed, checkpoint, stream, trajectory=0):
-    """Derive a stable seed without relying on Python's randomized ``hash``."""
-    if stream not in _STREAM_OFFSETS:
+    """Encode trajectory/checkpoint/probe/stream IDs in one readable seed."""
+    if stream not in _STREAM_IDS:
         raise KeyError(f"Unknown probe random stream: {stream}")
-    value = (
-        (int(base_seed) + 1) * 1_000_003
-        + (int(trajectory) + 1) * 10_000_019
-        + (int(checkpoint) + 1) * 100_003
-        + _STREAM_OFFSETS[stream]
+    return (
+        int(trajectory) * 1_000_000
+        + int(checkpoint) * 1_000
+        + int(base_seed) * 10
+        + _STREAM_IDS[stream]
     )
-    return value % _MAX_SEED
 
 
 def make_torch_generator(device, seed):
@@ -44,7 +42,7 @@ def make_probe_rng_streams(base_seed, checkpoint, device, trajectory=0):
             device,
             derive_probe_seed(base_seed, checkpoint, name, trajectory=trajectory),
         )
-        for name in _STREAM_OFFSETS
+        for name in _STREAM_IDS
     }
 
 
@@ -52,5 +50,5 @@ def probe_seed_manifest(base_seed, checkpoint, trajectory=0):
     """Return serializable stream seeds for provenance and debugging."""
     return {
         name: derive_probe_seed(base_seed, checkpoint, name, trajectory=trajectory)
-        for name in _STREAM_OFFSETS
+        for name in _STREAM_IDS
     }

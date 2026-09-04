@@ -63,9 +63,40 @@ contribution has been removed exactly.
 Gradient-batch indices, Langevin Gaussian draws, and evaluation-batch indices
 use independent deterministic random streams. Their seeds depend on training
 trajectory, probe trial, and checkpoint, but not on `c_h`; the scale audit
-therefore uses common random numbers across multipliers.
+therefore uses common random numbers across multipliers. The seed is the
+explicit decimal encoding `1_000_000*t + 1_000*k + 10*s + stream_id`, where
+`t`, `k`, and `s` are trajectory, checkpoint, and probe seed, and the three
+stream IDs are 0, 1, and 2.
+The five probe seeds themselves are the explicit `probe_seeds` list in
+`experiment_settings.json`.
 
 ## Reproducing the workflow
+
+### Five-trajectory DNN run
+
+The complete run is one shell command:
+
+```bash
+bash run_dnn_pipeline.sh
+```
+
+It trains seeds 1--5, runs the five-probe main comparison for each trajectory,
+then runs the configured multi-`c_h` audit. Results go to a new directory such
+as `outputs/dnn_5traj_YYYYMMDD_HHMMSS`; older outputs are not used or changed.
+The seed list is the `SEEDS` line near the top of the shell script.
+
+To continue an interrupted run, pass the same output directory again:
+
+```bash
+bash run_dnn_pipeline.sh outputs/dnn_5traj_YYYYMMDD_HHMMSS
+```
+
+Completed training trajectories and probe trials are skipped. Each training
+trajectory keeps its own `experiment_results.csv`, `sweep_summary.csv`, and
+paired-contrast table, so cross-trajectory reporting can be assembled later
+without pooling the 25 probe trials as if they were 25 trained networks.
+
+### Individual entry points
 
 Train one MLP trajectory and evaluate real train/test losses at every saved
 checkpoint, including epoch 0:

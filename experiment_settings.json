@@ -59,9 +59,10 @@
     "checkpoint_interval": 1,
     "full_gradient_batch_size": 1024,
     "record_linear_detrending": true,
-    "probe_rng_stream_version": 1,
+    "probe_rng_stream_version": 2,
     "num_trajectories": 1,
     "num_trials": 5,
+    "probe_seeds": [0, 1, 2, 3, 4],
     "device": "auto"
   },
   "dnn_h_sweep": {

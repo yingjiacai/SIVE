@@ -34,12 +34,14 @@ def train_mnist_checkpoints(probe_model, maxi_epochs=20, lr=0.1, root='./data',
     def save_ckpt(epoch, train_loss, test_loss):
         theta = parameters_to_vector(model.parameters()).detach().cpu().clone()
         path = os.path.join(output_dir, f"epoch_{epoch}.pt")
+        temporary = f"{path}.tmp"
         torch.save({
             "epoch": epoch,
             "theta": theta,
             "train_loss": train_loss,
             "test_loss": test_loss
-        }, path)
+        }, temporary)
+        os.replace(temporary, path)
         checkpoints[epoch] = path
         print(f"[Checkpoint] epoch={epoch}, path={path}")
 

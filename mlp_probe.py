@@ -1,5 +1,6 @@
 """Run the paired multi-scale audit on selected MNIST checkpoints."""
 
+import argparse
 import json
 import os
 from datetime import datetime
@@ -87,6 +88,12 @@ def paired_contrasts(rows, checkpoint_epochs):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-dir", help="Output directory for the sweep")
+    parser.add_argument("--checkpoint-root", default="outputs")
+    parser.add_argument("--trajectories", nargs="+", type=int, default=[0])
+    args = parser.parse_args()
+
     with open("experiment_settings.json", encoding="utf-8") as handle:
         settings = json.load(handle)
 
@@ -100,61 +107,105 @@ def main():
     if len(epochs) != 3:
         raise ValueError("The paired drop/rebound audit requires exactly three checkpoints.")
     num_trials = int(sweep.get("num_trials", base_config.get("num_trials", 5)))
-
-    all_checkpoints = discover_checkpoints(
-        "outputs/trajectory_0/mnist_checkpoints",
-        base_config.get("checkpoint_interval", 1),
+    probe_seeds = sweep.get(
+        "probe_seeds",
+        base_config.get("probe_seeds", list(range(num_trials))),
     )
-    checkpoints = {epoch: path for epoch, path in all_checkpoints.items() if epoch in epochs}
-    missing = epochs.difference(checkpoints)
-    if missing:
-        raise FileNotFoundError(f"Missing requested checkpoints: {sorted(missing)}")
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    sweep_dir = f"outputs/dnn_h_sweep_{stamp}"
-    os.makedirs(sweep_dir, exist_ok=False)
-    write_run_manifest(
-        sweep_dir,
-        {"base_config": base_config, "sweep": sweep},
-        seeds=range(num_trials),
-        source_root=".",
-    )
+    if args.output_dir:
+        sweep_dir = args.output_dir
+        os.makedirs(sweep_dir, exist_ok=True)
+    else:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        sweep_dir = f"outputs/dnn_h_sweep_{stamp}"
+        os.makedirs(sweep_dir, exist_ok=False)
+    manifest_path = os.path.join(sweep_dir, "run_manifest.json")
+    if not os.path.exists(manifest_path):
+        write_run_manifest(
+            sweep_dir,
+            {
+                "base_config": base_config,
+                "sweep": sweep,
+                "training_trajectories": args.trajectories,
+            },
+            seeds=probe_seeds,
+            source_root=".",
+        )
 
     model = MlpModel(root=base_config.get("data_root", "./data"), config=base_config)
-    combined_rows = []
-    for c_h in c_h_values:
-        config = dict(base_config)
-        config["c_h"] = float(c_h)
-        run_dir = os.path.join(sweep_dir, f"c_h_{format_scale(c_h)}")
-        os.makedirs(run_dir, exist_ok=False)
-        with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as handle:
-            json.dump(config, handle, indent=2, sort_keys=True)
+    for trajectory in args.trajectories:
+        all_checkpoints = discover_checkpoints(
+            os.path.join(
+                args.checkpoint_root,
+                f"trajectory_{trajectory}",
+                "mnist_checkpoints",
+            ),
+            base_config.get("checkpoint_interval", 1),
+        )
+        checkpoints = {
+            epoch: path for epoch, path in all_checkpoints.items() if epoch in epochs
+        }
+        missing = epochs.difference(checkpoints)
+        if missing:
+            raise FileNotFoundError(f"Missing requested checkpoints: {sorted(missing)}")
 
-        for trial in tqdm(range(num_trials), desc=f"c_h={c_h}", unit="trial"):
-            rows, histories = run_single_sgld(config, checkpoints, trial, model)
-            for row in rows:
-                row["c_h"] = float(c_h)
-                row["Trial"] = trial
-            combined_rows.extend(rows)
-            save_trial(run_dir, trial, rows, histories)
+        trajectory_dir = os.path.join(sweep_dir, f"trajectory_{trajectory}")
+        os.makedirs(trajectory_dir, exist_ok=True)
+        combined_rows = []
+        for c_h in c_h_values:
+            config = dict(base_config)
+            config["c_h"] = float(c_h)
+            run_dir = os.path.join(trajectory_dir, f"c_h_{format_scale(c_h)}")
+            os.makedirs(run_dir, exist_ok=True)
+            config_path = os.path.join(run_dir, "config.json")
+            if not os.path.exists(config_path):
+                with open(config_path, "w", encoding="utf-8") as handle:
+                    json.dump(config, handle, indent=2, sort_keys=True)
 
-    pd.DataFrame(combined_rows).to_csv(
-        os.path.join(sweep_dir, "sweep_raw.csv"), index=False
-    )
-    summary = summarize_sweep(combined_rows)
-    summary.to_csv(os.path.join(sweep_dir, "sweep_summary.csv"), index=False)
-    contrast_raw, contrast_summary = paired_contrasts(combined_rows, epochs)
-    contrast_raw.to_csv(
-        os.path.join(sweep_dir, "paired_contrasts_raw.csv"),
-        index=False,
-    )
-    contrast_summary.to_csv(
-        os.path.join(sweep_dir, "paired_contrasts_summary.csv"),
-        index=False,
-    )
-    print(summary.to_string(index=False))
-    print("\nPrespecified paired contrasts:")
-    print(contrast_summary.to_string(index=False))
+            for trial in tqdm(
+                probe_seeds,
+                desc=f"trajectory={trajectory}, c_h={c_h}",
+                unit="trial",
+            ):
+                raw_path = os.path.join(run_dir, f"raw_trial_{trial}.csv")
+                trace_path = os.path.join(run_dir, f"sgld_trial_{trial}.npz")
+                if os.path.exists(raw_path) and os.path.exists(trace_path):
+                    combined_rows.extend(pd.read_csv(raw_path).to_dict("records"))
+                    continue
+                rows, histories = run_single_sgld(
+                    config,
+                    checkpoints,
+                    trial,
+                    model,
+                    trajectory=trajectory,
+                )
+                for row in rows:
+                    row["c_h"] = float(c_h)
+                    row["Trial"] = trial
+                    row["Training_Seed"] = trajectory
+                combined_rows.extend(rows)
+                save_trial(run_dir, trial, rows, histories)
+
+        pd.DataFrame(combined_rows).to_csv(
+            os.path.join(trajectory_dir, "sweep_raw.csv"), index=False
+        )
+        summary = summarize_sweep(combined_rows)
+        summary.to_csv(
+            os.path.join(trajectory_dir, "sweep_summary.csv"), index=False
+        )
+        contrast_raw, contrast_summary = paired_contrasts(combined_rows, epochs)
+        contrast_raw.to_csv(
+            os.path.join(trajectory_dir, "paired_contrasts_raw.csv"),
+            index=False,
+        )
+        contrast_summary.to_csv(
+            os.path.join(trajectory_dir, "paired_contrasts_summary.csv"),
+            index=False,
+        )
+        print(f"\nTrajectory {trajectory}")
+        print(summary.to_string(index=False))
+        print("\nPrespecified paired contrasts:")
+        print(contrast_summary.to_string(index=False))
     print(f"Output: {sweep_dir}")
 
 

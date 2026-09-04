@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import random
@@ -17,11 +18,11 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def run_single_trial(config, num_trial):
+def run_single_trial(config, num_trial, output_dir=None):
     if config["model"] != "Mlp":
         raise ValueError(f"Unknown model: {config['model']}")
 
-    trial_dir = f"outputs/trajectory_{num_trial}"
+    trial_dir = output_dir or f"outputs/trajectory_{num_trial}"
     checkpoint_dir = os.path.join(trial_dir, "mnist_checkpoints")
     os.makedirs(trial_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -54,6 +55,13 @@ def run_experiment(config, num_trials):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train MNIST MLP trajectories.")
+    parser.add_argument("--seed", type=int, help="train one trajectory with this seed")
+    parser.add_argument("--output-dir", help="directory for that trajectory")
+    args = parser.parse_args()
+    if args.output_dir and args.seed is None:
+        parser.error("--output-dir requires --seed")
+
     experiments_list = ["mlp_trajectories"]
 
     experiment_settings = json.load(open("experiment_settings.json"))
@@ -69,5 +77,9 @@ if __name__ == "__main__":
         elif str(config["device"]).startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError("The configuration requests CUDA, but CUDA is unavailable.")
 
-        num_trials = config.get("num_trials", 5)
-        run_experiment(config, num_trials)
+        if args.seed is None:
+            num_trials = config.get("num_trials", 5)
+            run_experiment(config, num_trials)
+        else:
+            set_seed(args.seed)
+            run_single_trial(config, args.seed, output_dir=args.output_dir)
